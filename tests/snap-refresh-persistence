@@ -1,0 +1,178 @@
+#!/bin/bash
+set -euxo pipefail
+
+# Regression test verifying that an instance already running when
+# `snap refresh lxd` happens keeps working across the refresh. Checks three
+# independent things against the same running instance:
+#
+#   - devLXD: the devLXD socket and API must keep working from inside the
+#     instance after a refresh.
+#   - Instance deletion: the instance must still delete cleanly after a
+#     refresh.
+#   - Device hot-plug: hot-plugging a disk into the instance -- including a
+#     nested, recursive submount -- must make it visible inside the instance
+#     right away.
+#
+# Each is checked independently: a pass or failure in one says nothing about
+# the others.
+#
+# Two refresh rounds are run against the same container:
+#   round 1 (upgrade)     : baseline -> candidate
+#   round 2 (steady state): candidate -> candidate again
+# Both are checked, since an upgrade and a steady-state refresh are distinct
+# scenarios and either could expose a regression the other doesn't. Each
+# round installs its candidate with `snap install --dangerous`: LXD_SNAP_PATH
+# (see install_lxd() in bin/helpers and README.md) points it at a specific
+# snap under test, otherwise it's a fresh download of the current
+# LXD_SNAP_CHANNEL snap. Either way this is a real refresh -- an unasserted
+# install always gets its own new revision, even when its content is
+# identical to what's already installed.
+
+install_deps jq
+
+INSTANCE="c1"
+IMAGE="${TEST_IMG:-ubuntu-minimal-daily:26.04}"
+
+# check_devlxd asserts the devLXD socket exists inside the instance and that
+# the devLXD API actually answers real, correct data over it -- not just that
+# something is listening.
+check_devlxd() {
+    local stage="$1" meta_data
+
+    echo "==> Checking devLXD (${stage})"
+    lxc exec "${INSTANCE}" -- test -S /dev/lxd/sock
+
+    lxc exec "${INSTANCE}" -- curl --silent --show-error --fail --unix-socket /dev/lxd/sock http://custom.socket/1.0 | jq --exit-status .
+
+    meta_data="$(lxc exec "${INSTANCE}" -- curl --silent --show-error --fail --unix-socket /dev/lxd/sock http://custom.socket/1.0/meta-data)"
+    grep -xF "local-hostname: ${INSTANCE}" <<< "${meta_data}"
+}
+
+# check_hotplug hot-plugs a disk into the instance -- one plain file and, in
+# the same device, a nested submount reachable only with recursive=true --
+# confirms both are visible from inside the instance, then removes the
+# device again.
+check_hotplug() {
+    local stage="$1"
+    local marker="hotplug-${stage}-$$"
+
+    echo "==> Checking device hot-plug (${stage})"
+    # Make sure the mount/device don't outlive a failure anywhere below.
+    trap 'lxc config device remove "${INSTANCE}" hotplug || true; umount /root/hotplug-src/nested || true; cleanup' EXIT
+
+    # Defensive: a prior run that aborted between mounting and unmounting
+    # (e.g. a hotplug assertion below failing) can leave this mounted on a
+    # reused (self-hosted) runner, which would otherwise make the `rm -rf`
+    # fail with "resource busy".
+    if mountpoint -q /root/hotplug-src/nested; then
+        umount /root/hotplug-src/nested
+    fi
+    rm -rf /root/hotplug-src
+    mkdir -p /root/hotplug-src/nested
+    echo "${marker}" > /root/hotplug-src/top.txt
+    mount -t tmpfs tmpfs /root/hotplug-src/nested
+    echo "${marker}-nested" > /root/hotplug-src/nested/marker.txt
+
+    lxc config device add "${INSTANCE}" hotplug disk source=/root/hotplug-src path=/mnt/hotplug recursive=true
+    sleep 1
+
+    [ "$(lxc exec "${INSTANCE}" -- cat /mnt/hotplug/top.txt)" = "${marker}" ]
+    [ "$(lxc exec "${INSTANCE}" -- cat /mnt/hotplug/nested/marker.txt)" = "${marker}-nested" ]
+
+    lxc config device remove "${INSTANCE}" hotplug
+    umount /root/hotplug-src/nested
+    rm -rf /root/hotplug-src
+    trap cleanup EXIT
+}
+
+# refresh_lxd installs the candidate build under test (LXD_SNAP_PATH if set,
+# otherwise a fresh download of the current LXD_SNAP_CHANNEL snap) via
+# `snap install --dangerous`, and confirms the instance was NOT restarted in
+# the process -- a restarted instance would rebuild everything from scratch
+# and make every check below pass while proving nothing about surviving a
+# refresh.
+refresh_lxd() {
+    local stage="$1" pid_before pid_after snap_path dl_dir="" install_output
+
+    pid_before="$(lxc info "${INSTANCE}" | awk '/^PID:/ {print $2}')"
+
+    echo "==> Refreshing lxd (${stage})"
+    if [ -n "${LXD_SNAP_PATH:-}" ]; then
+        snap_path="${LXD_SNAP_PATH}"
+    else
+        # A same-channel `snap refresh` is a no-op whenever the channel
+        # hasn't published a new revision since the baseline install, which
+        # would silently skip the refresh this test exists to check.
+        # Downloading the channel's current snap and dangerous-installing it
+        # always produces a real refresh instead, since an unasserted
+        # install always gets its own new revision -- even when its content
+        # is identical to what's already installed.
+        dl_dir="$(mktemp -d)"
+        snap download lxd --channel="${LXD_SNAP_CHANNEL:-latest/edge}" --target-directory="${dl_dir}"
+        snap_path="$(echo "${dl_dir}"/*.snap)"
+    fi
+
+    install_output="$(snap install --dangerous "${snap_path}")"
+    echo "${install_output}"
+    # A dangerous install always reports "lxd <version> installed", even
+    # when reinstalling identical content -- confirm that's what happened
+    # rather than snapd silently treating this as a no-op.
+    grep -qE '^lxd .+ installed$' <<< "${install_output}"
+
+    # A dangerous install of an unasserted snap doesn't get its declared
+    # command aliases wired up automatically (that's assertion-based), so
+    # `lxc` would otherwise silently stop resolving after this point.
+    snap alias lxd.lxc lxc
+    [ -n "${dl_dir}" ] && rm -rf "${dl_dir}"
+
+    lxd waitready --timeout=300
+
+    pid_after="$(lxc info "${INSTANCE}" | awk '/^PID:/ {print $2}')"
+    if [ "${pid_before}" != "${pid_after}" ]; then
+        echo "${INSTANCE} was restarted during the refresh (PID ${pid_before} -> ${pid_after}); this run cannot validate refresh survival" >&2
+        exit 1
+    fi
+}
+
+echo "==> Installing baseline lxd (${LXD_SNAP_CHANNEL:-latest/stable})"
+# install_lxd() also honors LXD_SNAP_PATH (bin/helpers) and would install it
+# as the baseline, making the upgrade round below a no-op candidate ->
+# candidate refresh instead of baseline -> candidate. Hide it here so the
+# candidate is only ever installed by refresh_lxd().
+(unset LXD_SNAP_PATH; install_lxd)
+
+lxc network create lxdbr0
+lxc profile device add default eth0 nic network=lxdbr0
+
+poolName="snaprefresh$$"
+lxc storage create "${poolName}" zfs
+
+lxc launch "${IMAGE}" "${INSTANCE}" -s "${poolName}"
+waitInstanceBooted "${INSTANCE}"
+
+# curl is used from inside the instance to talk to devLXD; install it once so
+# it is present for every check across every refresh round below.
+lxc exec "${INSTANCE}" -- sh -c 'command -v curl >/dev/null || (apt-get update && apt-get install --no-install-recommends --yes curl)'
+
+echo "==> Sanity checks against the baseline, before any refresh"
+check_devlxd "baseline"
+check_hotplug "baseline"
+
+refresh_lxd "upgrade"
+check_devlxd "after-upgrade"
+check_hotplug "after-upgrade"
+
+refresh_lxd "steady-state"
+check_devlxd "after-steady-state-refresh"
+check_hotplug "after-steady-state-refresh"
+
+echo "==> Checking instance deletion after refresh"
+lxc delete -f "${INSTANCE}"
+
+echo "==> Cleaning up environment"
+lxc storage delete "${poolName}"
+lxc profile device remove default eth0
+lxc network delete lxdbr0
+
+# shellcheck disable=SC2034
+FAIL=0

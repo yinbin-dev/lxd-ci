@@ -134,6 +134,7 @@ jobs:
           - qemu-external-vm
           - snapcraft
           - snapd
+          - snap-refresh-persistence
           - storage-buckets
           - storage-disks-vm
           - storage-metadata
@@ -167,6 +168,35 @@ jobs:
             track: "5.21/edge"
           - test: csi
             os: 22.04
+          # 6/edge only for now: the fixes it regression-tests are not backported
+          - test: snap-refresh-persistence
+            track: "4.0/stable"
+          - test: snap-refresh-persistence
+            track: "4.0/candidate"
+          - test: snap-refresh-persistence
+            track: "4.0/edge"
+          - test: snap-refresh-persistence
+            track: "5.0/stable"
+          - test: snap-refresh-persistence
+            track: "5.0/candidate"
+          - test: snap-refresh-persistence
+            track: "5.0/edge"
+          - test: snap-refresh-persistence
+            track: "5.21/stable"
+          - test: snap-refresh-persistence
+            track: "5.21/candidate"
+          - test: snap-refresh-persistence
+            track: "5.21/edge"
+          - test: snap-refresh-persistence
+            track: "6/stable"
+          - test: snap-refresh-persistence
+            track: "6/candidate"
+          - test: snap-refresh-persistence
+            track: "latest/stable"
+          - test: snap-refresh-persistence
+            track: "latest/candidate"
+          - test: snap-refresh-persistence
+            track: "latest/edge"
           # not compatible with 4.0/*
           - test: bgp
             track: "4.0/candidate"
